@@ -1,7 +1,7 @@
 {
-  "name": "pdf-compressor-pro",
+  "name": "pdf-server-pro-vercel",
   "version": "1.0.0",
-  "description": "Professional PDF compression server using Express.js and pdf-lib",
+  "description": "Full PDF processing server for Vercel (compress, merge, split, extract, protect, watermark, metadata) using pdf-lib",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
   "dependencies": {
     "axios": "^1.7.0",
     "express": "^4.19.0",
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "pdf-parse": "^1.1.1"
   }
 }
