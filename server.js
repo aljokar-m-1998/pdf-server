@@ -6,186 +6,149 @@ import path from "path";
 import { fileURLToPath } from "url";
 import os from "os";
 
-// ==== إعدادات أساسية ====
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// نسمح بـ JSON
 app.use(express.json({ limit: "200mb" }));
 
-// لحساب مسار الملف الحالي
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ==== Route اختبار السيرفر ====
-
-app.get("/health", (req, res) => {
-  return res.status(200).json({
-    status: "ok",
-    message: "PDF Pro Server is running",
+// ✅ Route رئيسي — علشان السيرفر يظهر شغال
+app.get("/", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    server: "PDF Compressor PRO",
+    status: "running",
+    endpoints: {
+      health: "/health",
+      compress: "/compress"
+    }
   });
 });
 
-// ==== أدوات مساعدة ====
+// ✅ Route اختبار
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    message: "PDF Compressor PRO is healthy"
+  });
+});
 
-// إنشاء اسم ملف مؤقت
-function createTempFileName(prefix = "pdf") {
+// ✅ أدوات مساعدة
+function createTempFile(prefix = "pdf") {
   const random = Math.random().toString(36).substring(2, 10);
   return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${random}.pdf`);
 }
 
-// حذف ملف بأمان (بدون ما نكسر السيرفر لو فشل)
-function safeUnlink(filePath) {
+function safeDelete(filePath) {
   if (!filePath) return;
   fs.unlink(filePath, () => {});
 }
 
-// ==== الوظيفة الأساسية: تنزيل PDF من URL ====
-
-async function downloadPdfToTempFile(url) {
-  const tempPath = createTempFileName("source");
+// ✅ تنزيل PDF من URL
+async function downloadPdf(url) {
+  const tempPath = createTempFile("source");
 
   const response = await axios({
     method: "GET",
     url,
-    responseType: "stream",
+    responseType: "stream"
   });
 
   return new Promise((resolve, reject) => {
     const writer = fs.createWriteStream(tempPath);
-
     response.data.pipe(writer);
 
-    let error = null;
-    writer.on("error", (err) => {
-      error = err;
-      writer.close();
-      reject(err);
-    });
-
-    writer.on("close", () => {
-      if (!error) {
-        resolve(tempPath);
-      }
-    });
+    writer.on("error", reject);
+    writer.on("close", () => resolve(tempPath));
   });
 }
 
-// ==== الوظيفة الأساسية: "ضغط" / إعادة كتابة PDF ====
+// ✅ ضغط PDF (إعادة كتابة)
+async function compressPdf(inputPath) {
+  const outputPath = createTempFile("compressed");
 
-async function compressPdfFile(inputPath) {
-  const outputPath = createTempFileName("compressed");
+  const bytes = fs.readFileSync(inputPath);
+  const pdfDoc = await PDFDocument.load(bytes);
 
-  const existingPdfBytes = fs.readFileSync(inputPath);
+  const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
 
-  // pdf-lib: إعادة إنشاء PDF – بتنضّف شوية، مش أقوى ضغط في العالم
-  const pdfDoc = await PDFDocument.load(existingPdfBytes);
-  const compressedPdfBytes = await pdfDoc.save({ useObjectStreams: true });
-
-  fs.writeFileSync(outputPath, compressedPdfBytes);
+  fs.writeFileSync(outputPath, compressedBytes);
 
   return outputPath;
 }
 
-// ==== Route: ضغط PDF من رابط =====
-
+// ✅ Route ضغط PDF
 app.post("/compress", async (req, res) => {
-  const startTime = Date.now();
-
-  let sourcePath = null;
-  let compressedPath = null;
+  let source = null;
+  let compressed = null;
 
   try {
     const { publicUrl } = req.body;
 
-    if (!publicUrl || typeof publicUrl !== "string") {
+    if (!publicUrl) {
       return res.status(400).json({
         ok: false,
-        error: "publicUrl is required and must be a string",
+        error: "publicUrl is required"
       });
     }
 
-    // حماية بسيطة: نتأكد إنه PDF
     if (!publicUrl.toLowerCase().includes(".pdf")) {
       return res.status(400).json({
         ok: false,
-        error: "Provided URL does not look like a PDF",
+        error: "URL does not appear to be a PDF"
       });
     }
 
-    // 1) تنزيل PDF إلى ملف مؤقت
-    sourcePath = await downloadPdfToTempFile(publicUrl);
+    // ✅ تنزيل PDF
+    source = await downloadPdf(publicUrl);
 
-    // فحص الحجم (مثال: 150MB حد أقصى)
-    const stats = fs.statSync(sourcePath);
-    const maxSizeBytes = 150 * 1024 * 1024;
-    if (stats.size > maxSizeBytes) {
-      safeUnlink(sourcePath);
+    const stats = fs.statSync(source);
+    const maxSize = 150 * 1024 * 1024;
+
+    if (stats.size > maxSize) {
+      safeDelete(source);
       return res.status(413).json({
         ok: false,
-        error: "File too large. Max allowed size is 150MB",
+        error: "File too large (max 150MB)"
       });
     }
 
-    // 2) "ضغط" / إعادة كتابة PDF
-    compressedPath = await compressPdfFile(sourcePath);
+    // ✅ ضغط PDF
+    compressed = await compressPdf(source);
 
     const originalSize = stats.size;
-    const compressedSize = fs.statSync(compressedPath).size;
-    const ratio =
-      originalSize > 0 ? (1 - compressedSize / originalSize) * 100 : 0;
+    const compressedSize = fs.statSync(compressed).size;
 
-    // 3) إعداد الرد
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="compressed.pdf"'
-    );
+    res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
 
-    const readStream = fs.createReadStream(compressedPath);
+    const stream = fs.createReadStream(compressed);
+    stream.pipe(res);
 
-    readStream.on("error", (err) => {
-      console.error("Error streaming compressed PDF:", err);
-      if (!res.headersSent) {
-        return res
-          .status(500)
-          .json({ ok: false, error: "Error streaming compressed file" });
-      }
+    stream.on("close", () => {
+      safeDelete(source);
+      safeDelete(compressed);
     });
 
-    readStream.pipe(res);
-
-    readStream.on("close", () => {
-      const duration = Date.now() - startTime;
-      console.log(
-        `Compression done. Original: ${(
-          originalSize /
-          (1024 * 1024)
-        ).toFixed(2)}MB, Compressed: ${(compressedSize / (1024 * 1024)).toFixed(
-          2
-        )}MB, Saved: ${ratio.toFixed(2)}%, Time: ${duration}ms`
-      );
-      safeUnlink(sourcePath);
-      safeUnlink(compressedPath);
-    });
   } catch (err) {
-    console.error("Error in /compress:", err);
-    safeUnlink(sourcePath);
-    safeUnlink(compressedPath);
+    console.error("Compression error:", err);
+
+    safeDelete(source);
+    safeDelete(compressed);
 
     if (!res.headersSent) {
-      return res.status(500).json({
+      res.status(500).json({
         ok: false,
-        error: "Internal server error while compressing PDF",
-        detail: err?.message || "Unknown error",
+        error: "Internal server error",
+        detail: err.message
       });
     }
   }
 });
 
-// ==== تشغيل السيرفر محليًا ====
-
+// ✅ تشغيل محلي
 app.listen(PORT, () => {
-  console.log(`PDF Pro Server running on port ${PORT}`);
+  console.log(`PDF Compressor PRO running on port ${PORT}`);
 });
