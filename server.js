@@ -1,332 +1,185 @@
-// ==============================
-// إعدادات وتهيئة السيرفر
-// ==============================
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const { PDFDocument } = require("pdf-lib");
-const pdfParse = require("pdf-parse");
+/**
+ * Single-File PDF Compression Server (Express.js)
+ * * Dependencies: npm install express cors
+ * System Requirement: Ghostscript (gs) must be installed on the system.
+ */
+
+const express = require('express');
+const cors = require('cors');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const crypto = require('crypto');
+
+// --- Configuration ---
+const PORT = process.env.PORT || 3000;
+const SUPABASE_URL = "https://tdqewqarcvdunwuxgios.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkcWV3cWFyY3ZkdW53dXhnaW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0ODc4NDcsImV4cCI6MjA4MTA2Mzg0N30.RSMghTLwda7kLidTohBFLqE7qCQoHs3S6l88ewUidRw";
+const BUCKET_NAME = "pdf-files";
+
+// Configure paths for temp files
+const TEMP_DIR = path.join(__dirname, 'temp');
+if (!fs.existsSync(TEMP_DIR)) {
+    fs.mkdirSync(TEMP_DIR);
+}
+
+// Promisify pipeline for clean async/await stream handling
+const streamPipeline = promisify(pipeline);
 
 const app = express();
 
-// CORS مع إمكانية تخصيص الدومين لاحقًا
-app.use(cors({
-  origin: "*", // غيّرها لدومين واجهتك في الإنتاج لو حابب
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
-}));
+// --- Middleware ---
+app.use(cors());
+app.use(express.json()); // Parse JSON bodies
 
-app.use(express.json());
-
-// ==============================
-// إعداد رفع الملفات (Multer)
-// ==============================
-
-const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
-const ALLOWED_MIME_TYPES = ["application/pdf"];
-
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: MAX_FILE_SIZE
-  },
-  fileFilter: (req, file, cb) => {
-    if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-      return cb(new Error("النوع المسموح به هو PDF فقط"));
-    }
-    cb(null, true);
-  }
-});
-
-// Middleware عام للتعامل مع أخطاء Multer
-function multerErrorHandler(err, req, res, next) {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({ error: "حجم الملف أكبر من الحد المسموح به" });
-    }
-    return res.status(400).json({ error: "خطأ في رفع الملف", details: err.message });
-  } else if (err) {
-    return res.status(400).json({ error: err.message || "خطأ في الملف" });
-  }
-  next();
-}
-
-// ==============================
-// دوال مساعدة (Helpers)
-// ==============================
-
-// رد موحّد للنجاح
-function sendJson(res, data, status = 200) {
-  return res.status(status).json({ success: true, ...data });
-}
-
-// رد موحّد للخطأ
-function sendError(res, message, status = 400, extra = {}) {
-  console.error("❌ Error:", message, extra);
-  return res.status(status).json({ success: false, error: message, ...extra });
-}
-
-// التحقق من وجود ملف
-function ensureFile(req, res) {
-  if (!req.file) {
-    sendError(res, "لا يوجد ملف PDF في الطلب", 400);
-    return false;
-  }
-  return true;
-}
-
-// التحقق من وجود ملفات متعددة
-function ensureFiles(req, res) {
-  if (!req.files || req.files.length === 0) {
-    sendError(res, "لا توجد ملفات PDF في الطلب", 400);
-    return false;
-  }
-  return true;
-}
-
-// ==============================
-// Route اختبار
-// ==============================
-app.get("/", (req, res) => {
-  sendJson(res, { message: "✅ السيرفر شغال بقوة يا محمود" });
-});
-
-// ==============================
-// 1) Split PDF  (/split)
-// ==============================
-// يستقبل: file (PDF), startPage, endPage
-// يرجّع: PDF جديد بالصفحات المطلوبة
-app.post(
-  "/split",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
-
-      let { startPage, endPage } = req.body;
-
-      if (!startPage) return sendError(res, "startPage مطلوب", 400);
-      startPage = parseInt(startPage, 10);
-      endPage = endPage ? parseInt(endPage, 10) : startPage;
-
-      if (isNaN(startPage) || isNaN(endPage)) {
-        return sendError(res, "startPage و endPage يجب أن يكونوا أرقام صحيحة", 400);
-      }
-
-      const originalPdf = await PDFDocument.load(req.file.buffer);
-      const totalPages = originalPdf.getPageCount();
-
-      const safeStart = Math.max(1, Math.min(startPage, totalPages));
-      const safeEnd = Math.max(safeStart, Math.min(endPage, totalPages));
-
-      if (safeStart > safeEnd) {
-        return sendError(res, "نطاق الصفحات غير صحيح", 400, { totalPages });
-      }
-
-      const newPdf = await PDFDocument.create();
-      const indices = [];
-      for (let i = safeStart - 1; i < safeEnd; i++) indices.push(i);
-
-      const copiedPages = await newPdf.copyPages(originalPdf, indices);
-      copiedPages.forEach(page => newPdf.addPage(page));
-
-      const pdfBytes = await newPdf.save();
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=split.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /split:", err);
-      sendError(res, "حدث خطأ أثناء تقسيم الملف", 500);
-    }
-  }
-);
-
-// ==============================
-// 2) Merge PDF  (/merge)
-// ==============================
-// يستقبل: files[] (عدة ملفات PDF)
-// يرجّع: ملف PDF واحد مدموج
-app.post(
-  "/merge",
-  upload.array("files", 15),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFiles(req, res)) return;
-
-      const mergedPdf = await PDFDocument.create();
-
-      for (const file of req.files) {
-        try {
-          const pdf = await PDFDocument.load(file.buffer);
-          const copiedPages = await mergedPdf.copyPages(
-            pdf,
-            pdf.getPageIndices()
-          );
-          copiedPages.forEach(page => mergedPdf.addPage(page));
-        } catch (fileErr) {
-          console.error("ملف غير صالح أثناء الدمج:", file.originalname);
+// --- Helper: Download File Stream ---
+// Uses native https to avoid extra dependencies like axios
+const downloadFile = (url, destPath) => {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(destPath);
+        
+        // Parse URL to ensure we are using https
+        if (!url.startsWith('https')) {
+            return reject(new Error('Only HTTPS URLs are supported'));
         }
-      }
 
-      if (mergedPdf.getPageCount() === 0) {
-        return sendError(res, "لم يتم دمج أي صفحات. ربما كل الملفات تالفة.", 400);
-      }
+        const request = https.get(url, {
+            headers: {
+                // Although public, we provide auth headers just in case of RLS policies
+                'apikey': SUPABASE_ANON_KEY,
+                'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+            }
+        }, (response) => {
+            if (response.statusCode !== 200) {
+                return reject(new Error(`Failed to download file. Status Code: ${response.statusCode}`));
+            }
 
-      const pdfBytes = await mergedPdf.save();
+            // Pipe response to file
+            pipeline(response, file, (err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=merged.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /merge:", err);
-      sendError(res, "حدث خطأ أثناء دمج الملفات", 500);
+        request.on('error', (err) => {
+            fs.unlink(destPath, () => {}); // Delete partial file on error
+            reject(err);
+        });
+    });
+};
+
+// --- Helper: Compress PDF using Ghostscript ---
+const compressPdf = (inputPath, outputPath) => {
+    return new Promise((resolve, reject) => {
+        // Ghostscript command for ebook quality (approx 150 dpi) - good balance of size/quality
+        // -dPDFSETTINGS=/screen (72 dpi, smallest)
+        // -dPDFSETTINGS=/ebook (150 dpi, medium - BEST FOR GENERAL USE)
+        // -dPDFSETTINGS=/prepress (300 dpi, high quality)
+        
+        const command = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/ebook -dNOPAUSE -dQUIET -dBATCH -sOutputFile="${outputPath}" "${inputPath}"`;
+
+        exec(command, (error, stdout, stderr) => {
+            if (error) {
+                console.error("Ghostscript error:", stderr);
+                return reject(error);
+            }
+            resolve(outputPath);
+        });
+    });
+};
+
+// --- Helper: Cleanup Files ---
+const cleanupFiles = (paths) => {
+    paths.forEach(p => {
+        if (fs.existsSync(p)) {
+            fs.unlink(p, (err) => {
+                if (err) console.error(`Error deleting temp file ${p}:`, err);
+            });
+        }
+    });
+};
+
+// --- Routes ---
+
+// 1. Health Check
+app.get('/test', (req, res) => {
+    res.status(200).json({ 
+        status: 'ok', 
+        message: 'PDF Compression Server is running',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// 2. Compress Endpoint
+app.post('/compress', async (req, res) => {
+    const { pdfUrl } = req.body;
+
+    // Validation
+    if (!pdfUrl) {
+        return res.status(400).json({ error: 'Missing "pdfUrl" in request body.' });
     }
-  }
-);
 
-// ==============================
-// 3) Compress PDF  (/compress)
-// ==============================
-// ضغط مبدئي: إعادة بناء الملف، تقليل Streams، مناسب كبداية
-app.post(
-  "/compress",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
+    // Security: Ensure URL belongs to Supabase (prevent arbitrary SSRF)
+    if (!pdfUrl.includes('supabase.co')) {
+        return res.status(400).json({ error: 'Invalid URL source. Only Supabase URLs allowed.' });
+    }
+
+    const requestId = crypto.randomUUID();
+    const inputFilePath = path.join(TEMP_DIR, `input_${requestId}.pdf`);
+    const outputFilePath = path.join(TEMP_DIR, `output_${requestId}.pdf`);
+
     try {
-      if (!ensureFile(req, res)) return;
+        console.log(`[${requestId}] Starting download: ${pdfUrl}`);
+        
+        // 1. Download (Streamed to disk to handle large files)
+        await downloadFile(pdfUrl, inputFilePath);
+        
+        console.log(`[${requestId}] Download complete. Starting compression...`);
 
-      const originalSize = req.file.buffer.length;
-      const pdfDoc = await PDFDocument.load(req.file.buffer, {
-        ignoreEncryption: true
-      });
+        // 2. Compress
+        await compressPdf(inputFilePath, outputFilePath);
 
-      const pdfBytes = await pdfDoc.save({
-        useObjectStreams: true
-      });
+        console.log(`[${requestId}] Compression complete. Sending file...`);
 
-      const newSize = pdfBytes.length;
+        // 3. Return File
+        // We use res.download which handles streams internally
+        res.download(outputFilePath, 'compressed-file.pdf', (err) => {
+            if (err) {
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Error sending file.' });
+                }
+            }
+            // 4. Cleanup after response is finished
+            cleanupFiles([inputFilePath, outputFilePath]);
+        });
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
-      res.send(Buffer.from(pdfBytes));
+    } catch (error) {
+        console.error(`[${requestId}] Error:`, error.message);
+        
+        // Cleanup on error
+        cleanupFiles([inputFilePath, outputFilePath]);
 
-      console.log(`ضغط PDF من ${originalSize} إلى ${newSize} بايت`);
-    } catch (err) {
-      console.error("خطأ في /compress:", err);
-      sendError(res, "حدث خطأ أثناء ضغط الملف", 500);
+        if (error.message.includes('Command failed')) {
+            return res.status(500).json({ 
+                error: 'Compression failed. Please ensure Ghostscript is installed on the server.' 
+            });
+        }
+
+        res.status(500).json({ 
+            error: 'Internal Server Error', 
+            details: error.message 
+        });
     }
-  }
-);
+});
 
-// ==============================
-// 4) Extract Text  (/extract-text)
-// ==============================
-// يستقبل: file (PDF)
-// يرجّع: JSON فيه النص
-app.post(
-  "/extract-text",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
-
-      const data = await pdfParse(req.file.buffer);
-      const text = data.text || "";
-
-      sendJson(res, {
-        text,
-        pages: data.numpages || null,
-        info: data.info || null
-      });
-    } catch (err) {
-      console.error("خطأ في /extract-text:", err);
-      sendError(res, "حدث خطأ أثناء استخراج النص", 500);
-    }
-  }
-);
-
-// ==============================
-// 5) Extract Pages  (/extract-pages)
-// ==============================
-// يستقبل: file (PDF), pages (مثال: "1,3,5-7")
-// يرجّع: PDF جديد فيه الصفحات المطلوبة
-function parsePagesExpression(pagesExpression, totalPages) {
-  const pages = new Set();
-  const parts = pagesExpression.split(",").map(p => p.trim()).filter(Boolean);
-
-  for (const part of parts) {
-    if (part.includes("-")) {
-      const [startStr, endStr] = part.split("-").map(x => x.trim());
-      let start = parseInt(startStr, 10);
-      let end = parseInt(endStr, 10);
-      if (isNaN(start) || isNaN(end)) continue;
-      if (start > end) [start, end] = [end, start];
-
-      start = Math.max(1, start);
-      end = Math.min(totalPages, end);
-
-      for (let i = start; i <= end; i++) {
-        pages.add(i);
-      }
-    } else {
-      const p = parseInt(part, 10);
-      if (!isNaN(p) && p >= 1 && p <= totalPages) {
-        pages.add(p);
-      }
-    }
-  }
-
-  return Array.from(pages).sort((a, b) => a - b);
-}
-
-app.post(
-  "/extract-pages",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
-
-      const { pages } = req.body;
-      if (!pages || typeof pages !== "string") {
-        return sendError(res, "يجب إرسال قائمة الصفحات (مثال: 1,3,5-7)", 400);
-      }
-
-      const originalPdf = await PDFDocument.load(req.file.buffer);
-      const totalPages = originalPdf.getPageCount();
-
-      const pageNumbers = parsePagesExpression(pages, totalPages);
-
-      if (pageNumbers.length === 0) {
-        return sendError(res, "لا يوجد صفحات صالحة في الطلب", 400, { totalPages });
-      }
-
-      const newPdf = await PDFDocument.create();
-      const zeroBasedIndices = pageNumbers.map(p => p - 1);
-      const copiedPages = await newPdf.copyPages(originalPdf, zeroBasedIndices);
-      copiedPages.forEach(page => newPdf.addPage(page));
-
-      const pdfBytes = await newPdf.save();
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=extracted-pages.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /extract-pages:", err);
-      sendError(res, "حدث خطأ أثناء استخراج الصفحات", 500);
-    }
-  }
-);
-
-// ==============================
-// تشغيل السيرفر محليًا
-// ==============================
-const PORT = process.env.PORT || 5000;
+// --- Server Start ---
 app.listen(PORT, () => {
-  console.log(`✅ السيرفر شغال بقوة على http://localhost:${PORT}`);
+    console.log(`--- PDF Compression Server ---`);
+    console.log(`Running on port: ${PORT}`);
+    console.log(`Supabase URL: ${SUPABASE_URL}`);
+    console.log(`Temp Directory: ${TEMP_DIR}`);
+    console.log(`------------------------------`);
 });
