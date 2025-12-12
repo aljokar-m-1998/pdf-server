@@ -1,19 +1,22 @@
 import express from "express";
-import cors from "cors"; // 💡 تم إضافة CORS
+import cors from "cors"; 
 import axios from "axios";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import fs from "fs/promises"; // 💡 استخدام fs/promises للتعامل غير المتزامن
+// 💡 استيراد الدوال غير المتزامنة (promises) والدوال المتزامنة/Streams معاً
+import fs from "fs/promises"; 
+import fs_sync from "fs"; 
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
-// import pdfParse from "pdf-parse"; // 💡 تم إزالة هذه المكتبة لتجنب انهيار Vercel
+// تم إزالة استيراد pdfParse لتجنب انهيار Vercel (خطأ 500)
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 💡 إعدادات CORS: السماح لجميع النطاقات مؤقتاً لحل المشكلة (الأفضل استخدام نطاق الواجهة الأمامية)
+// 💡 حل مشكلة CORS: السماح لجميع النطاقات بالاتصال
 app.use(cors());
 
+// تحديد حجم الحمولة القصوى
 app.use(express.json({ limit: "200mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
@@ -37,6 +40,7 @@ async function safeDelete(filePath) {
   }
 }
 
+// 💡 تعديل لاستخدام fs_sync.createWriteStream
 async function downloadToTempFile(url) {
   const tempPath = createTempFile("source");
   const response = await axios({
@@ -46,7 +50,7 @@ async function downloadToTempFile(url) {
   });
 
   return new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(tempPath);
+    const writer = fs_sync.createWriteStream(tempPath);
     response.data.pipe(writer);
     let error = null;
 
@@ -71,6 +75,7 @@ async function ensureSizeLimit(filePath) {
   return stats.size;
 }
 
+// 💡 تعديل لاستخدام fs_sync.createReadStream
 function sendPdfFile(res, filePath, fileName, cleanupPaths = []) {
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
@@ -78,7 +83,7 @@ function sendPdfFile(res, filePath, fileName, cleanupPaths = []) {
     `attachment; filename="${fileName || "file.pdf"}"`
   );
 
-  const stream = fs.createReadStream(filePath);
+  const stream = fs_sync.createReadStream(filePath);
   stream.pipe(res);
 
   stream.on("close", async () => {
@@ -308,8 +313,7 @@ app.post("/extract-pages", async (req, res) => {
   }
 });
 
-// ====== 4) Extract text: /extract-text ======
-// 💡 تم إزالة هذه الوظيفة مؤقتاً بسبب تعارض pdf-parse مع Vercel.
+// ====== 4) Extract text: /extract-text (REMOVED) ======
 
 // ====== 5) Info: /info ======
 
@@ -331,7 +335,6 @@ app.post("/info", async (req, res) => {
 
     const pageCount = pdf.getPageCount();
 
-    // 💡 معلومات إضافية من PDF-lib
     const title = pdf.getTitle() || 'N/A';
     const author = pdf.getAuthor() || 'N/A';
 
