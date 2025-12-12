@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors"; // <<-- 1. إضافة استيراد CORS
 import axios from "axios";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import fs from "fs";
@@ -9,6 +10,13 @@ import pdfParse from "pdf-parse";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// =========================================================
+// 2. تفعيل CORS للسماح بالاتصال من الواجهة الأمامية (الفرعية)
+// هذا يسمح لجميع النطاقات بالاتصال (لتبسيط الحل).
+// إذا أردت نطاقاً محدداً، استخدم: app.use(cors({ origin: 'https://your-frontend-subdomain.vercel.app' }));
+app.use(cors());
+// =========================================================
 
 app.use(express.json({ limit: "200mb" }));
 
