@@ -1,22 +1,18 @@
 import express from "express";
-import cors from "cors"; // <<-- 1. إضافة استيراد CORS
+import cors from "cors"; // 💡 تم إضافة CORS
 import axios from "axios";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import fs from "fs";
+import fs from "fs/promises"; // 💡 استخدام fs/promises للتعامل غير المتزامن
 import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
-import pdfParse from "pdf-parse";
+// import pdfParse from "pdf-parse"; // 💡 تم إزالة هذه المكتبة لتجنب انهيار Vercel
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// =========================================================
-// 2. تفعيل CORS للسماح بالاتصال من الواجهة الأمامية (الفرعية)
-// هذا يسمح لجميع النطاقات بالاتصال (لتبسيط الحل).
-// إذا أردت نطاقاً محدداً، استخدم: app.use(cors({ origin: 'https://your-frontend-subdomain.vercel.app' }));
+// 💡 إعدادات CORS: السماح لجميع النطاقات مؤقتاً لحل المشكلة (الأفضل استخدام نطاق الواجهة الأمامية)
 app.use(cors());
-// =========================================================
 
 app.use(express.json({ limit: "200mb" }));
 
@@ -25,12 +21,6 @@ const __dirname = path.dirname(__filename);
 
 const MAX_SIZE_BYTES = 150 * 1024 * 1024; // 150MB
 
-// لو حبيت تستخدم بيانات Supabase هنا في المستقبل
-const SUPABASE_URL = "https://tdqewqarcvdunwuxgios.supabase.co";
-const SUPABASE_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkcWV3cWFyY3ZkdW53dXhnaW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0ODc4NDcsImV4cCI6MjA4MTA2Mzg0N30.RSMghTLwda7kLidTohBFLqE7qCQoHs3S6l88ewUidRw";
-const BUCKET_NAME = "pdf-files";
-
 // ====== Helpers ======
 
 function createTempFile(prefix = "pdf") {
@@ -38,9 +28,13 @@ function createTempFile(prefix = "pdf") {
   return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${random}.pdf`);
 }
 
-function safeDelete(filePath) {
+async function safeDelete(filePath) {
   if (!filePath) return;
-  fs.unlink(filePath, () => {});
+  try {
+    await fs.unlink(filePath);
+  } catch (e) {
+    // تجاهل أخطاء عدم وجود الملف
+  }
 }
 
 async function downloadToTempFile(url) {
@@ -69,9 +63,9 @@ async function downloadToTempFile(url) {
 }
 
 async function ensureSizeLimit(filePath) {
-  const stats = fs.statSync(filePath);
+  const stats = await fs.stat(filePath);
   if (stats.size > MAX_SIZE_BYTES) {
-    safeDelete(filePath);
+    await safeDelete(filePath);
     throw new Error("File too large (max 150MB)");
   }
   return stats.size;
@@ -87,13 +81,13 @@ function sendPdfFile(res, filePath, fileName, cleanupPaths = []) {
   const stream = fs.createReadStream(filePath);
   stream.pipe(res);
 
-  stream.on("close", () => {
-    cleanupPaths.forEach(safeDelete);
+  stream.on("close", async () => {
+    for (const p of cleanupPaths) await safeDelete(p);
   });
 
-  stream.on("error", (err) => {
+  stream.on("error", async (err) => {
     console.error("Error streaming PDF:", err);
-    cleanupPaths.forEach(safeDelete);
+    for (const p of cleanupPaths) await safeDelete(p);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -115,7 +109,7 @@ app.get("/", (req, res) => {
       compress: "/compress",
       merge: "/merge",
       extractPages: "/extract-pages",
-      extractText: "/extract-text",
+      // extractText: "/extract-text", // تم إزالتها مؤقتاً
       info: "/info",
       protect: "/protect",
       unlock: "/unlock",
@@ -151,15 +145,15 @@ app.post("/compress", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     const originalSize = await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdfDoc = await PDFDocument.load(bytes);
 
     const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
 
     output = createTempFile("compressed");
-    fs.writeFileSync(output, compressedBytes);
+    await fs.writeFile(output, compressedBytes);
 
-    const compressedSize = fs.statSync(output).size;
+    const compressedSize = (await fs.stat(output)).size;
 
     res.setHeader(
       "X-PDF-Info",
@@ -176,8 +170,8 @@ app.post("/compress", async (req, res) => {
     sendPdfFile(res, output, "compressed.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /compress:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
 
     if (!res.headersSent) {
       const status =
@@ -213,7 +207,7 @@ app.post("/merge", async (req, res) => {
       tempFiles.push(filePath);
       await ensureSizeLimit(filePath);
 
-      const bytes = fs.readFileSync(filePath);
+      const bytes = await fs.readFile(filePath);
       const pdf = await PDFDocument.load(bytes);
       const copied = await mergeDoc.copyPages(
         pdf,
@@ -224,13 +218,13 @@ app.post("/merge", async (req, res) => {
 
     const mergedBytes = await mergeDoc.save();
     mergedPath = createTempFile("merged");
-    fs.writeFileSync(mergedPath, mergedBytes);
+    await fs.writeFile(mergedPath, mergedBytes);
 
     sendPdfFile(res, mergedPath, "merged.pdf", [...tempFiles, mergedPath]);
   } catch (err) {
     console.error("Error in /merge:", err);
-    tempFiles.forEach(safeDelete);
-    safeDelete(mergedPath);
+    for (const p of tempFiles) await safeDelete(p);
+    await safeDelete(mergedPath);
 
     if (!res.headersSent) {
       res.status(500).json({
@@ -260,7 +254,7 @@ app.post("/extract-pages", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const srcPdf = await PDFDocument.load(bytes);
 
     const targetPdf = await PDFDocument.create();
@@ -297,13 +291,13 @@ app.post("/extract-pages", async (req, res) => {
 
     const newBytes = await targetPdf.save();
     output = createTempFile("pages");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "extracted-pages.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /extract-pages:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
 
     if (!res.headersSent) {
       res.status(500).json({
@@ -315,42 +309,7 @@ app.post("/extract-pages", async (req, res) => {
 });
 
 // ====== 4) Extract text: /extract-text ======
-
-app.post("/extract-text", async (req, res) => {
-  let source = null;
-  try {
-    const { publicUrl } = req.body;
-    if (!publicUrl) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "publicUrl is required" });
-    }
-
-    source = await downloadToTempFile(publicUrl);
-    await ensureSizeLimit(source);
-
-    const dataBuffer = fs.readFileSync(source);
-    const data = await pdfParse(dataBuffer);
-
-    res.status(200).json({
-      ok: true,
-      text: data.text || "",
-      info: data.info || {},
-      numpages: data.numpages || 0,
-    });
-
-    safeDelete(source);
-  } catch (err) {
-    console.error("Error in /extract-text:", err);
-    safeDelete(source);
-    if (!res.headersSent) {
-      res.status(500).json({
-        ok: false,
-        error: err.message || "Internal error",
-      });
-    }
-  }
-});
+// 💡 تم إزالة هذه الوظيفة مؤقتاً بسبب تعارض pdf-parse مع Vercel.
 
 // ====== 5) Info: /info ======
 
@@ -367,22 +326,27 @@ app.post("/info", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     const size = await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const pageCount = pdf.getPageCount();
+
+    // 💡 معلومات إضافية من PDF-lib
+    const title = pdf.getTitle() || 'N/A';
+    const author = pdf.getAuthor() || 'N/A';
 
     res.status(200).json({
       ok: true,
       pages: pageCount,
       sizeBytes: size,
       sizeMB: (size / (1024 * 1024)).toFixed(2),
+      metadata: { title, author }
     });
 
-    safeDelete(source);
+    await safeDelete(source);
   } catch (err) {
     console.error("Error in /info:", err);
-    safeDelete(source);
+    await safeDelete(source);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -393,10 +357,6 @@ app.post("/info", async (req, res) => {
 });
 
 // ====== 6) Protect PDF with password: /protect ======
-// NOTE: pdf-lib doesn't natively support encryption/password.
-// في Vercel مفيش مكتبة native جاهزة.
-// هنا هنعمل "حماية منطقية" عن طريق إضافة صفحة تحذير + metadata.
-// ده جاهز ليوم ما ننقل للسيرفر اللي فيه مكتبة تشفير حقيقية.
 
 app.post("/protect", async (req, res) => {
   let source = null;
@@ -413,7 +373,7 @@ app.post("/protect", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const font = await pdf.embedFont(StandardFonts.Helvetica);
@@ -436,13 +396,13 @@ True encryption is not applied (Vercel limitation).`;
 
     const newBytes = await pdf.save();
     output = createTempFile("protected");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "protected.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /protect:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -453,7 +413,6 @@ True encryption is not applied (Vercel limitation).`;
 });
 
 // ====== 7) Unlock PDF: /unlock ======
-// هنا بنشيل صفحة التحذير لو موجودة وننضف الـ metadata
 
 app.post("/unlock", async (req, res) => {
   let source = null;
@@ -469,7 +428,7 @@ app.post("/unlock", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const pageCount = pdf.getPageCount();
@@ -486,13 +445,13 @@ app.post("/unlock", async (req, res) => {
 
     const newBytes = await newPdf.save();
     output = createTempFile("unlocked");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "unlocked.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /unlock:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -520,7 +479,7 @@ app.post("/watermark-text", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const font = await pdf.embedFont(StandardFonts.HelveticaBold);
@@ -547,13 +506,13 @@ app.post("/watermark-text", async (req, res) => {
 
     const newBytes = await pdf.save();
     output = createTempFile("watermark");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "watermarked.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /watermark-text:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -581,7 +540,7 @@ app.post("/rotate-pages", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const angleDeg = parseInt(angle, 10) || 0;
@@ -614,13 +573,13 @@ app.post("/rotate-pages", async (req, res) => {
 
     const newBytes = await pdf.save();
     output = createTempFile("rotated");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "rotated.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /rotate-pages:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -631,8 +590,6 @@ app.post("/rotate-pages", async (req, res) => {
 });
 
 // ====== 10) Reorder pages: /reorder-pages ======
-// المدخل: { publicUrl, order }
-// مثال: order = [3,1,2] → الصفحة 3 تبقى الأولى، 1 تبقى الثانية...
 
 app.post("/reorder-pages", async (req, res) => {
   let source = null;
@@ -650,7 +607,7 @@ app.post("/reorder-pages", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     const pageCount = pdf.getPageCount();
@@ -672,13 +629,13 @@ app.post("/reorder-pages", async (req, res) => {
 
     const newBytes = await newPdf.save();
     output = createTempFile("reordered");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "reordered.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /reorder-pages:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -689,7 +646,6 @@ app.post("/reorder-pages", async (req, res) => {
 });
 
 // ====== 11) Edit metadata: /metadata ======
-// المدخل: { publicUrl, title?, author?, subject?, keywords? }
 
 app.post("/metadata", async (req, res) => {
   let source = null;
@@ -706,7 +662,7 @@ app.post("/metadata", async (req, res) => {
     source = await downloadToTempFile(publicUrl);
     await ensureSizeLimit(source);
 
-    const bytes = fs.readFileSync(source);
+    const bytes = await fs.readFile(source);
     const pdf = await PDFDocument.load(bytes);
 
     if (title) pdf.setTitle(title);
@@ -716,13 +672,13 @@ app.post("/metadata", async (req, res) => {
 
     const newBytes = await pdf.save();
     output = createTempFile("metadata");
-    fs.writeFileSync(output, newBytes);
+    await fs.writeFile(output, newBytes);
 
     sendPdfFile(res, output, "metadata.pdf", [source, output]);
   } catch (err) {
     console.error("Error in /metadata:", err);
-    safeDelete(source);
-    safeDelete(output);
+    await safeDelete(source);
+    await safeDelete(output);
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -732,7 +688,7 @@ app.post("/metadata", async (req, res) => {
   }
 });
 
-// ====== Local run ======
+// ====== Local run (ignored by Vercel) ======
 
 app.listen(PORT, () => {
   console.log(`PDF Server PRO running on port ${PORT}`);
