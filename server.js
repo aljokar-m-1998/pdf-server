@@ -1,256 +1,332 @@
-// server.js
-// سيرفر واحد بـ Express فيه كل الـ Routes اللي محتاجها الواجهة
-
+// ==============================
+// إعدادات وتهيئة السيرفر
+// ==============================
 const express = require("express");
 const cors = require("cors");
-const bodyParser = require("body-parser");
-
+const multer = require("multer");
+const { PDFDocument } = require("pdf-lib");
 const pdfParse = require("pdf-parse");
-const PDFMerger = require("pdf-merger-js");
-const { PDFDocument, degrees } = require("pdf-lib");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(bodyParser.json({ limit: "50mb" }));
+// CORS مع إمكانية تخصيص الدومين لاحقًا
+app.use(cors({
+  origin: "*", // غيّرها لدومين واجهتك في الإنتاج لو حابب
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"]
+}));
 
-// Helper لتحويل Base64 لـ Buffer
-function decodeBase64Pdf(fileBase64) {
-  try {
-    return Buffer.from(fileBase64, "base64");
-  } catch (e) {
-    return null;
+app.use(express.json());
+
+// ==============================
+// إعداد رفع الملفات (Multer)
+// ==============================
+
+const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
+const ALLOWED_MIME_TYPES = ["application/pdf"];
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_FILE_SIZE
+  },
+  fileFilter: (req, file, cb) => {
+    if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      return cb(new Error("النوع المسموح به هو PDF فقط"));
+    }
+    cb(null, true);
   }
+});
+
+// Middleware عام للتعامل مع أخطاء Multer
+function multerErrorHandler(err, req, res, next) {
+  if (err instanceof multer.MulterError) {
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ error: "حجم الملف أكبر من الحد المسموح به" });
+    }
+    return res.status(400).json({ error: "خطأ في رفع الملف", details: err.message });
+  } else if (err) {
+    return res.status(400).json({ error: err.message || "خطأ في الملف" });
+  }
+  next();
 }
 
-// ============== اختبار رئيسي ==============
+// ==============================
+// دوال مساعدة (Helpers)
+// ==============================
+
+// رد موحّد للنجاح
+function sendJson(res, data, status = 200) {
+  return res.status(status).json({ success: true, ...data });
+}
+
+// رد موحّد للخطأ
+function sendError(res, message, status = 400, extra = {}) {
+  console.error("❌ Error:", message, extra);
+  return res.status(status).json({ success: false, error: message, ...extra });
+}
+
+// التحقق من وجود ملف
+function ensureFile(req, res) {
+  if (!req.file) {
+    sendError(res, "لا يوجد ملف PDF في الطلب", 400);
+    return false;
+  }
+  return true;
+}
+
+// التحقق من وجود ملفات متعددة
+function ensureFiles(req, res) {
+  if (!req.files || req.files.length === 0) {
+    sendError(res, "لا توجد ملفات PDF في الطلب", 400);
+    return false;
+  }
+  return true;
+}
+
+// ==============================
+// Route اختبار
+// ==============================
 app.get("/", (req, res) => {
-  res.send("PDF Master Tool Server is running");
+  sendJson(res, { message: "✅ السيرفر شغال بقوة يا محمود" });
 });
 
-// ============== 1) استخراج النص ==============
-app.post("/extract-text", async (req, res) => {
-  try {
-    const { fileBase64 } = req.body || {};
+// ==============================
+// 1) Split PDF  (/split)
+// ==============================
+// يستقبل: file (PDF), startPage, endPage
+// يرجّع: PDF جديد بالصفحات المطلوبة
+app.post(
+  "/split",
+  upload.single("file"),
+  multerErrorHandler,
+  async (req, res) => {
+    try {
+      if (!ensureFile(req, res)) return;
 
-    if (!fileBase64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No fileBase64 provided" });
-    }
+      let { startPage, endPage } = req.body;
 
-    const buffer = decodeBase64Pdf(fileBase64);
-    if (!buffer) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
+      if (!startPage) return sendError(res, "startPage مطلوب", 400);
+      startPage = parseInt(startPage, 10);
+      endPage = endPage ? parseInt(endPage, 10) : startPage;
 
-    const result = await pdfParse(buffer);
-
-    return res.status(200).json({
-      ok: true,
-      text: result.text || "",
-    });
-  } catch (err) {
-    console.error("extract-text error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Failed to extract text" });
-  }
-});
-
-// ============== 2) دمج PDF ==============
-app.post("/merge", async (req, res) => {
-  try {
-    const { files } = req.body || {};
-
-    if (!files || !Array.isArray(files) || files.length < 2) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Provide at least two files" });
-    }
-
-    const merger = new PDFMerger();
-
-    for (const fileBase64 of files) {
-      const buffer = decodeBase64Pdf(fileBase64);
-      if (!buffer) {
-        return res.status(400).json({ ok: false, error: "Invalid base64" });
+      if (isNaN(startPage) || isNaN(endPage)) {
+        return sendError(res, "startPage و endPage يجب أن يكونوا أرقام صحيحة", 400);
       }
-      await merger.add(buffer);
-    }
 
-    const mergedBuffer = await merger.saveAsBuffer();
+      const originalPdf = await PDFDocument.load(req.file.buffer);
+      const totalPages = originalPdf.getPageCount();
 
-    return res.status(200).json({
-      ok: true,
-      fileBase64: mergedBuffer.toString("base64"),
-    });
-  } catch (err) {
-    console.error("merge error:", err);
-    return res.status(500).json({ ok: false, error: "Failed to merge PDFs" });
-  }
-});
+      const safeStart = Math.max(1, Math.min(startPage, totalPages));
+      const safeEnd = Math.max(safeStart, Math.min(endPage, totalPages));
 
-// ============== 3) تقسيم PDF لصفحات منفصلة ==============
-app.post("/split", async (req, res) => {
-  try {
-    const { fileBase64 } = req.body || {};
+      if (safeStart > safeEnd) {
+        return sendError(res, "نطاق الصفحات غير صحيح", 400, { totalPages });
+      }
 
-    if (!fileBase64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No fileBase64 provided" });
-    }
-
-    const buffer = decodeBase64Pdf(fileBase64);
-    if (!buffer) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
-
-    const pdfDoc = await PDFDocument.load(buffer);
-    const totalPages = pdfDoc.getPageCount();
-
-    const outputs = [];
-
-    for (let i = 0; i < totalPages; i++) {
       const newPdf = await PDFDocument.create();
-      const [page] = await newPdf.copyPages(pdfDoc, [i]);
-      newPdf.addPage(page);
-      const bytes = await newPdf.save();
-      outputs.push(bytes.toString("base64"));
-    }
+      const indices = [];
+      for (let i = safeStart - 1; i < safeEnd; i++) indices.push(i);
 
-    return res.status(200).json({
-      ok: true,
-      files: outputs,
-    });
-  } catch (err) {
-    console.error("split error:", err);
-    return res.status(500).json({ ok: false, error: "Failed to split PDF" });
+      const copiedPages = await newPdf.copyPages(originalPdf, indices);
+      copiedPages.forEach(page => newPdf.addPage(page));
+
+      const pdfBytes = await newPdf.save();
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=split.pdf");
+      res.send(Buffer.from(pdfBytes));
+    } catch (err) {
+      console.error("خطأ في /split:", err);
+      sendError(res, "حدث خطأ أثناء تقسيم الملف", 500);
+    }
   }
-});
+);
 
-// ============== 4) تدوير الصفحات ==============
-// body: { fileBase64, direction: "left" | "right" }
-app.post("/rotate", async (req, res) => {
-  try {
-    const { fileBase64, direction } = req.body || {};
+// ==============================
+// 2) Merge PDF  (/merge)
+// ==============================
+// يستقبل: files[] (عدة ملفات PDF)
+// يرجّع: ملف PDF واحد مدموج
+app.post(
+  "/merge",
+  upload.array("files", 15),
+  multerErrorHandler,
+  async (req, res) => {
+    try {
+      if (!ensureFiles(req, res)) return;
 
-    if (!fileBase64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No fileBase64 provided" });
+      const mergedPdf = await PDFDocument.create();
+
+      for (const file of req.files) {
+        try {
+          const pdf = await PDFDocument.load(file.buffer);
+          const copiedPages = await mergedPdf.copyPages(
+            pdf,
+            pdf.getPageIndices()
+          );
+          copiedPages.forEach(page => mergedPdf.addPage(page));
+        } catch (fileErr) {
+          console.error("ملف غير صالح أثناء الدمج:", file.originalname);
+        }
+      }
+
+      if (mergedPdf.getPageCount() === 0) {
+        return sendError(res, "لم يتم دمج أي صفحات. ربما كل الملفات تالفة.", 400);
+      }
+
+      const pdfBytes = await mergedPdf.save();
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=merged.pdf");
+      res.send(Buffer.from(pdfBytes));
+    } catch (err) {
+      console.error("خطأ في /merge:", err);
+      sendError(res, "حدث خطأ أثناء دمج الملفات", 500);
     }
-
-    const buffer = decodeBase64Pdf(fileBase64);
-    if (!buffer) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
-
-    const pdfDoc = await PDFDocument.load(buffer);
-    const pages = pdfDoc.getPages();
-
-    const angle = direction === "left" ? -90 : 90;
-
-    for (const page of pages) {
-      const currentRotation = page.getRotation().angle || 0;
-      page.setRotation(degrees(currentRotation + angle));
-    }
-
-    const rotatedBytes = await pdfDoc.save();
-
-    return res.status(200).json({
-      ok: true,
-      fileBase64: rotatedBytes.toString("base64"),
-    });
-  } catch (err) {
-    console.error("rotate error:", err);
-    return res.status(500).json({ ok: false, error: "Failed to rotate PDF" });
   }
-});
+);
 
-// ============== 5) قراءة الميتاداتا ==============
-app.post("/metadata-read", async (req, res) => {
-  try {
-    const { fileBase64 } = req.body || {};
+// ==============================
+// 3) Compress PDF  (/compress)
+// ==============================
+// ضغط مبدئي: إعادة بناء الملف، تقليل Streams، مناسب كبداية
+app.post(
+  "/compress",
+  upload.single("file"),
+  multerErrorHandler,
+  async (req, res) => {
+    try {
+      if (!ensureFile(req, res)) return;
 
-    if (!fileBase64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No fileBase64 provided" });
+      const originalSize = req.file.buffer.length;
+      const pdfDoc = await PDFDocument.load(req.file.buffer, {
+        ignoreEncryption: true
+      });
+
+      const pdfBytes = await pdfDoc.save({
+        useObjectStreams: true
+      });
+
+      const newSize = pdfBytes.length;
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
+      res.send(Buffer.from(pdfBytes));
+
+      console.log(`ضغط PDF من ${originalSize} إلى ${newSize} بايت`);
+    } catch (err) {
+      console.error("خطأ في /compress:", err);
+      sendError(res, "حدث خطأ أثناء ضغط الملف", 500);
     }
-
-    const buffer = decodeBase64Pdf(fileBase64);
-    if (!buffer) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
-
-    const pdfDoc = await PDFDocument.load(buffer);
-
-    const metadata = {
-      title: pdfDoc.getTitle() || null,
-      author: pdfDoc.getAuthor() || null,
-      subject: pdfDoc.getSubject() || null,
-      keywords: pdfDoc.getKeywords() || null,
-      creator: pdfDoc.getCreator() || null,
-      producer: pdfDoc.getProducer() || null,
-    };
-
-    return res.status(200).json({
-      ok: true,
-      metadata,
-    });
-  } catch (err) {
-    console.error("metadata-read error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Failed to read metadata" });
   }
-});
+);
 
-// ============== 6) تعديل الميتاداتا ==============
-// body: { fileBase64, metadata: { title, author, subject, keywords, creator } }
-app.post("/metadata-write", async (req, res) => {
-  try {
-    const { fileBase64, metadata } = req.body || {};
+// ==============================
+// 4) Extract Text  (/extract-text)
+// ==============================
+// يستقبل: file (PDF)
+// يرجّع: JSON فيه النص
+app.post(
+  "/extract-text",
+  upload.single("file"),
+  multerErrorHandler,
+  async (req, res) => {
+    try {
+      if (!ensureFile(req, res)) return;
 
-    if (!fileBase64) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "No fileBase64 provided" });
+      const data = await pdfParse(req.file.buffer);
+      const text = data.text || "";
+
+      sendJson(res, {
+        text,
+        pages: data.numpages || null,
+        info: data.info || null
+      });
+    } catch (err) {
+      console.error("خطأ في /extract-text:", err);
+      sendError(res, "حدث خطأ أثناء استخراج النص", 500);
     }
-
-    const buffer = decodeBase64Pdf(fileBase64);
-    if (!buffer) {
-      return res.status(400).json({ ok: false, error: "Invalid base64" });
-    }
-
-    const pdfDoc = await PDFDocument.load(buffer);
-
-    if (metadata) {
-      if (metadata.title) pdfDoc.setTitle(metadata.title);
-      if (metadata.author) pdfDoc.setAuthor(metadata.author);
-      if (metadata.subject) pdfDoc.setSubject(metadata.subject);
-      if (metadata.keywords) pdfDoc.setKeywords(metadata.keywords);
-      if (metadata.creator) pdfDoc.setCreator(metadata.creator);
-    }
-
-    const updatedBytes = await pdfDoc.save();
-
-    return res.status(200).json({
-      ok: true,
-      fileBase64: updatedBytes.toString("base64"),
-    });
-  } catch (err) {
-    console.error("metadata-write error:", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: "Failed to write metadata" });
   }
-});
+);
 
-// ============== تشغيل السيرفر ==============
+// ==============================
+// 5) Extract Pages  (/extract-pages)
+// ==============================
+// يستقبل: file (PDF), pages (مثال: "1,3,5-7")
+// يرجّع: PDF جديد فيه الصفحات المطلوبة
+function parsePagesExpression(pagesExpression, totalPages) {
+  const pages = new Set();
+  const parts = pagesExpression.split(",").map(p => p.trim()).filter(Boolean);
+
+  for (const part of parts) {
+    if (part.includes("-")) {
+      const [startStr, endStr] = part.split("-").map(x => x.trim());
+      let start = parseInt(startStr, 10);
+      let end = parseInt(endStr, 10);
+      if (isNaN(start) || isNaN(end)) continue;
+      if (start > end) [start, end] = [end, start];
+
+      start = Math.max(1, start);
+      end = Math.min(totalPages, end);
+
+      for (let i = start; i <= end; i++) {
+        pages.add(i);
+      }
+    } else {
+      const p = parseInt(part, 10);
+      if (!isNaN(p) && p >= 1 && p <= totalPages) {
+        pages.add(p);
+      }
+    }
+  }
+
+  return Array.from(pages).sort((a, b) => a - b);
+}
+
+app.post(
+  "/extract-pages",
+  upload.single("file"),
+  multerErrorHandler,
+  async (req, res) => {
+    try {
+      if (!ensureFile(req, res)) return;
+
+      const { pages } = req.body;
+      if (!pages || typeof pages !== "string") {
+        return sendError(res, "يجب إرسال قائمة الصفحات (مثال: 1,3,5-7)", 400);
+      }
+
+      const originalPdf = await PDFDocument.load(req.file.buffer);
+      const totalPages = originalPdf.getPageCount();
+
+      const pageNumbers = parsePagesExpression(pages, totalPages);
+
+      if (pageNumbers.length === 0) {
+        return sendError(res, "لا يوجد صفحات صالحة في الطلب", 400, { totalPages });
+      }
+
+      const newPdf = await PDFDocument.create();
+      const zeroBasedIndices = pageNumbers.map(p => p - 1);
+      const copiedPages = await newPdf.copyPages(originalPdf, zeroBasedIndices);
+      copiedPages.forEach(page => newPdf.addPage(page));
+
+      const pdfBytes = await newPdf.save();
+
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "attachment; filename=extracted-pages.pdf");
+      res.send(Buffer.from(pdfBytes));
+    } catch (err) {
+      console.error("خطأ في /extract-pages:", err);
+      sendError(res, "حدث خطأ أثناء استخراج الصفحات", 500);
+    }
+  }
+);
+
+// ==============================
+// تشغيل السيرفر محليًا
+// ==============================
+const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`PDF server running on port ${PORT}`);
+  console.log(`✅ السيرفر شغال بقوة على http://localhost:${PORT}`);
 });
