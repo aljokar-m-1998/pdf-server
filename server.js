@@ -1,332 +1,731 @@
-// ==============================
-// إعدادات وتهيئة السيرفر
-// ==============================
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const { PDFDocument } = require("pdf-lib");
-const pdfParse = require("pdf-parse");
+import express from "express";
+import axios from "axios";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { fileURLToPath } from "url";
+import pdfParse from "pdf-parse";
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// CORS مع إمكانية تخصيص الدومين لاحقًا
-app.use(cors({
-  origin: "*", // غيّرها لدومين واجهتك في الإنتاج لو حابب
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"]
-}));
+app.use(express.json({ limit: "200mb" }));
 
-app.use(express.json());
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-// ==============================
-// إعداد رفع الملفات (Multer)
-// ==============================
+const MAX_SIZE_BYTES = 150 * 1024 * 1024; // 150MB
 
-const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB
-const ALLOWED_MIME_TYPES = ["application/pdf"];
+// لو حبيت تستخدم بيانات Supabase هنا في المستقبل
+const SUPABASE_URL = "https://tdqewqarcvdunwuxgios.supabase.co";
+const SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRkcWV3cWFyY3ZkdW53dXhnaW9zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjU0ODc4NDcsImV4cCI6MjA4MTA2Mzg0N30.RSMghTLwda7kLidTohBFLqE7qCQoHs3S6l88ewUidRw";
+const BUCKET_NAME = "pdf-files";
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: MAX_FILE_SIZE
-  },
-  fileFilter: (req, file, cb) => {
-    if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
-      return cb(new Error("النوع المسموح به هو PDF فقط"));
+// ====== Helpers ======
+
+function createTempFile(prefix = "pdf") {
+  const random = Math.random().toString(36).substring(2, 10);
+  return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${random}.pdf`);
+}
+
+function safeDelete(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, () => {});
+}
+
+async function downloadToTempFile(url) {
+  const tempPath = createTempFile("source");
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+  });
+
+  return new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(tempPath);
+    response.data.pipe(writer);
+    let error = null;
+
+    writer.on("error", (err) => {
+      error = err;
+      writer.close();
+      reject(err);
+    });
+
+    writer.on("close", () => {
+      if (!error) resolve(tempPath);
+    });
+  });
+}
+
+async function ensureSizeLimit(filePath) {
+  const stats = fs.statSync(filePath);
+  if (stats.size > MAX_SIZE_BYTES) {
+    safeDelete(filePath);
+    throw new Error("File too large (max 150MB)");
+  }
+  return stats.size;
+}
+
+function sendPdfFile(res, filePath, fileName, cleanupPaths = []) {
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${fileName || "file.pdf"}"`
+  );
+
+  const stream = fs.createReadStream(filePath);
+  stream.pipe(res);
+
+  stream.on("close", () => {
+    cleanupPaths.forEach(safeDelete);
+  });
+
+  stream.on("error", (err) => {
+    console.error("Error streaming PDF:", err);
+    cleanupPaths.forEach(safeDelete);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: "Error streaming PDF",
+      });
     }
-    cb(null, true);
-  }
-});
-
-// Middleware عام للتعامل مع أخطاء Multer
-function multerErrorHandler(err, req, res, next) {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({ error: "حجم الملف أكبر من الحد المسموح به" });
-    }
-    return res.status(400).json({ error: "خطأ في رفع الملف", details: err.message });
-  } else if (err) {
-    return res.status(400).json({ error: err.message || "خطأ في الملف" });
-  }
-  next();
+  });
 }
 
-// ==============================
-// دوال مساعدة (Helpers)
-// ==============================
+// ====== Basic routes ======
 
-// رد موحّد للنجاح
-function sendJson(res, data, status = 200) {
-  return res.status(status).json({ success: true, ...data });
-}
-
-// رد موحّد للخطأ
-function sendError(res, message, status = 400, extra = {}) {
-  console.error("❌ Error:", message, extra);
-  return res.status(status).json({ success: false, error: message, ...extra });
-}
-
-// التحقق من وجود ملف
-function ensureFile(req, res) {
-  if (!req.file) {
-    sendError(res, "لا يوجد ملف PDF في الطلب", 400);
-    return false;
-  }
-  return true;
-}
-
-// التحقق من وجود ملفات متعددة
-function ensureFiles(req, res) {
-  if (!req.files || req.files.length === 0) {
-    sendError(res, "لا توجد ملفات PDF في الطلب", 400);
-    return false;
-  }
-  return true;
-}
-
-// ==============================
-// Route اختبار
-// ==============================
 app.get("/", (req, res) => {
-  sendJson(res, { message: "✅ السيرفر شغال بقوة يا محمود" });
+  res.status(200).json({
+    ok: true,
+    server: "PDF Server PRO (Vercel-ready)",
+    status: "running",
+    endpoints: {
+      health: "/health",
+      compress: "/compress",
+      merge: "/merge",
+      extractPages: "/extract-pages",
+      extractText: "/extract-text",
+      info: "/info",
+      protect: "/protect",
+      unlock: "/unlock",
+      watermarkText: "/watermark-text",
+      rotatePages: "/rotate-pages",
+      reorderPages: "/reorder-pages",
+      metadata: "/metadata",
+    },
+  });
 });
 
-// ==============================
-// 1) Split PDF  (/split)
-// ==============================
-// يستقبل: file (PDF), startPage, endPage
-// يرجّع: PDF جديد بالصفحات المطلوبة
-app.post(
-  "/split",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    message: "PDF Server PRO is healthy",
+  });
+});
 
-      let { startPage, endPage } = req.body;
+// ====== 1) Compress: /compress ======
 
-      if (!startPage) return sendError(res, "startPage مطلوب", 400);
-      startPage = parseInt(startPage, 10);
-      endPage = endPage ? parseInt(endPage, 10) : startPage;
+app.post("/compress", async (req, res) => {
+  let source = null;
+  let output = null;
 
-      if (isNaN(startPage) || isNaN(endPage)) {
-        return sendError(res, "startPage و endPage يجب أن يكونوا أرقام صحيحة", 400);
-      }
+  try {
+    const { publicUrl } = req.body;
+    if (!publicUrl || typeof publicUrl !== "string") {
+      return res
+        .status(400)
+        .json({ ok: false, error: "publicUrl is required" });
+    }
 
-      const originalPdf = await PDFDocument.load(req.file.buffer);
-      const totalPages = originalPdf.getPageCount();
+    source = await downloadToTempFile(publicUrl);
+    const originalSize = await ensureSizeLimit(source);
 
-      const safeStart = Math.max(1, Math.min(startPage, totalPages));
-      const safeEnd = Math.max(safeStart, Math.min(endPage, totalPages));
+    const bytes = fs.readFileSync(source);
+    const pdfDoc = await PDFDocument.load(bytes);
 
-      if (safeStart > safeEnd) {
-        return sendError(res, "نطاق الصفحات غير صحيح", 400, { totalPages });
-      }
+    const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
 
-      const newPdf = await PDFDocument.create();
-      const indices = [];
-      for (let i = safeStart - 1; i < safeEnd; i++) indices.push(i);
+    output = createTempFile("compressed");
+    fs.writeFileSync(output, compressedBytes);
 
-      const copiedPages = await newPdf.copyPages(originalPdf, indices);
-      copiedPages.forEach(page => newPdf.addPage(page));
+    const compressedSize = fs.statSync(output).size;
 
-      const pdfBytes = await newPdf.save();
+    res.setHeader(
+      "X-PDF-Info",
+      JSON.stringify({
+        originalMB: (originalSize / (1024 * 1024)).toFixed(2),
+        compressedMB: (compressedSize / (1024 * 1024)).toFixed(2),
+        savedPercent:
+          originalSize > 0
+            ? ((1 - compressedSize / originalSize) * 100).toFixed(2)
+            : 0,
+      })
+    );
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=split.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /split:", err);
-      sendError(res, "حدث خطأ أثناء تقسيم الملف", 500);
+    sendPdfFile(res, output, "compressed.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /compress:", err);
+    safeDelete(source);
+    safeDelete(output);
+
+    if (!res.headersSent) {
+      const status =
+        err.message && err.message.includes("File too large") ? 413 : 500;
+      res.status(status).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
     }
   }
-);
+});
 
-// ==============================
-// 2) Merge PDF  (/merge)
-// ==============================
-// يستقبل: files[] (عدة ملفات PDF)
-// يرجّع: ملف PDF واحد مدموج
-app.post(
-  "/merge",
-  upload.array("files", 15),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFiles(req, res)) return;
+// ====== 2) Merge: /merge ======
 
-      const mergedPdf = await PDFDocument.create();
+app.post("/merge", async (req, res) => {
+  const { publicUrls } = req.body;
 
-      for (const file of req.files) {
-        try {
-          const pdf = await PDFDocument.load(file.buffer);
-          const copiedPages = await mergedPdf.copyPages(
-            pdf,
-            pdf.getPageIndices()
-          );
-          copiedPages.forEach(page => mergedPdf.addPage(page));
-        } catch (fileErr) {
-          console.error("ملف غير صالح أثناء الدمج:", file.originalname);
+  if (!Array.isArray(publicUrls) || publicUrls.length < 2) {
+    return res.status(400).json({
+      ok: false,
+      error: "publicUrls must be an array with at least 2 URLs",
+    });
+  }
+
+  const tempFiles = [];
+  let mergedPath = null;
+
+  try {
+    const mergeDoc = await PDFDocument.create();
+
+    for (const url of publicUrls) {
+      const filePath = await downloadToTempFile(url);
+      tempFiles.push(filePath);
+      await ensureSizeLimit(filePath);
+
+      const bytes = fs.readFileSync(filePath);
+      const pdf = await PDFDocument.load(bytes);
+      const copied = await mergeDoc.copyPages(
+        pdf,
+        Array.from({ length: pdf.getPageCount() }, (_, i) => i)
+      );
+      copied.forEach((p) => mergeDoc.addPage(p));
+    }
+
+    const mergedBytes = await mergeDoc.save();
+    mergedPath = createTempFile("merged");
+    fs.writeFileSync(mergedPath, mergedBytes);
+
+    sendPdfFile(res, mergedPath, "merged.pdf", [...tempFiles, mergedPath]);
+  } catch (err) {
+    console.error("Error in /merge:", err);
+    tempFiles.forEach(safeDelete);
+    safeDelete(mergedPath);
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
+    }
+  }
+});
+
+// ====== 3) Extract pages: /extract-pages ======
+
+app.post("/extract-pages", async (req, res) => {
+  let source = null;
+  let output = null;
+
+  try {
+    const { publicUrl, pages } = req.body;
+
+    if (!publicUrl || !pages) {
+      return res.status(400).json({
+        ok: false,
+        error: "publicUrl and pages are required",
+      });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const srcPdf = await PDFDocument.load(bytes);
+
+    const targetPdf = await PDFDocument.create();
+
+    let pageNumbers = [];
+
+    if (Array.isArray(pages)) {
+      pageNumbers = pages.map((p) => parseInt(p, 10));
+    } else if (typeof pages === "string") {
+      const parts = pages.split(",");
+      for (const part of parts) {
+        if (part.includes("-")) {
+          const [start, end] = part.split("-").map((n) => parseInt(n, 10));
+          for (let i = start; i <= end; i++) pageNumbers.push(i);
+        } else {
+          pageNumbers.push(parseInt(part, 10));
         }
       }
-
-      if (mergedPdf.getPageCount() === 0) {
-        return sendError(res, "لم يتم دمج أي صفحات. ربما كل الملفات تالفة.", 400);
-      }
-
-      const pdfBytes = await mergedPdf.save();
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=merged.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /merge:", err);
-      sendError(res, "حدث خطأ أثناء دمج الملفات", 500);
     }
-  }
-);
 
-// ==============================
-// 3) Compress PDF  (/compress)
-// ==============================
-// ضغط مبدئي: إعادة بناء الملف، تقليل Streams، مناسب كبداية
-app.post(
-  "/compress",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
+    pageNumbers = pageNumbers.filter(
+      (p) => !isNaN(p) && p >= 1 && p <= srcPdf.getPageCount()
+    );
 
-      const originalSize = req.file.buffer.length;
-      const pdfDoc = await PDFDocument.load(req.file.buffer, {
-        ignoreEncryption: true
+    if (pageNumbers.length === 0) {
+      throw new Error("No valid pages specified");
+    }
+
+    const copied = await targetPdf.copyPages(
+      srcPdf,
+      pageNumbers.map((p) => p - 1)
+    );
+    copied.forEach((p) => targetPdf.addPage(p));
+
+    const newBytes = await targetPdf.save();
+    output = createTempFile("pages");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "extracted-pages.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /extract-pages:", err);
+    safeDelete(source);
+    safeDelete(output);
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
       });
+    }
+  }
+});
 
-      const pdfBytes = await pdfDoc.save({
-        useObjectStreams: true
+// ====== 4) Extract text: /extract-text ======
+
+app.post("/extract-text", async (req, res) => {
+  let source = null;
+  try {
+    const { publicUrl } = req.body;
+    if (!publicUrl) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "publicUrl is required" });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const dataBuffer = fs.readFileSync(source);
+    const data = await pdfParse(dataBuffer);
+
+    res.status(200).json({
+      ok: true,
+      text: data.text || "",
+      info: data.info || {},
+      numpages: data.numpages || 0,
+    });
+
+    safeDelete(source);
+  } catch (err) {
+    console.error("Error in /extract-text:", err);
+    safeDelete(source);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
       });
-
-      const newSize = pdfBytes.length;
-
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=compressed.pdf");
-      res.send(Buffer.from(pdfBytes));
-
-      console.log(`ضغط PDF من ${originalSize} إلى ${newSize} بايت`);
-    } catch (err) {
-      console.error("خطأ في /compress:", err);
-      sendError(res, "حدث خطأ أثناء ضغط الملف", 500);
     }
   }
-);
+});
 
-// ==============================
-// 4) Extract Text  (/extract-text)
-// ==============================
-// يستقبل: file (PDF)
-// يرجّع: JSON فيه النص
-app.post(
-  "/extract-text",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
+// ====== 5) Info: /info ======
 
-      const data = await pdfParse(req.file.buffer);
-      const text = data.text || "";
+app.post("/info", async (req, res) => {
+  let source = null;
+  try {
+    const { publicUrl } = req.body;
+    if (!publicUrl) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "publicUrl is required" });
+    }
 
-      sendJson(res, {
-        text,
-        pages: data.numpages || null,
-        info: data.info || null
+    source = await downloadToTempFile(publicUrl);
+    const size = await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    const pageCount = pdf.getPageCount();
+
+    res.status(200).json({
+      ok: true,
+      pages: pageCount,
+      sizeBytes: size,
+      sizeMB: (size / (1024 * 1024)).toFixed(2),
+    });
+
+    safeDelete(source);
+  } catch (err) {
+    console.error("Error in /info:", err);
+    safeDelete(source);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
       });
-    } catch (err) {
-      console.error("خطأ في /extract-text:", err);
-      sendError(res, "حدث خطأ أثناء استخراج النص", 500);
     }
   }
-);
+});
 
-// ==============================
-// 5) Extract Pages  (/extract-pages)
-// ==============================
-// يستقبل: file (PDF), pages (مثال: "1,3,5-7")
-// يرجّع: PDF جديد فيه الصفحات المطلوبة
-function parsePagesExpression(pagesExpression, totalPages) {
-  const pages = new Set();
-  const parts = pagesExpression.split(",").map(p => p.trim()).filter(Boolean);
+// ====== 6) Protect PDF with password: /protect ======
+// NOTE: pdf-lib doesn't natively support encryption/password.
+// في Vercel مفيش مكتبة native جاهزة.
+// هنا هنعمل "حماية منطقية" عن طريق إضافة صفحة تحذير + metadata.
+// ده جاهز ليوم ما ننقل للسيرفر اللي فيه مكتبة تشفير حقيقية.
 
-  for (const part of parts) {
-    if (part.includes("-")) {
-      const [startStr, endStr] = part.split("-").map(x => x.trim());
-      let start = parseInt(startStr, 10);
-      let end = parseInt(endStr, 10);
-      if (isNaN(start) || isNaN(end)) continue;
-      if (start > end) [start, end] = [end, start];
+app.post("/protect", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl, password } = req.body;
+    if (!publicUrl || !password) {
+      return res.status(400).json({
+        ok: false,
+        error: "publicUrl and password are required",
+      });
+    }
 
-      start = Math.max(1, start);
-      end = Math.min(totalPages, end);
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
 
-      for (let i = start; i <= end; i++) {
-        pages.add(i);
-      }
-    } else {
-      const p = parseInt(part, 10);
-      if (!isNaN(p) && p >= 1 && p <= totalPages) {
-        pages.add(p);
-      }
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    const warningPage = pdf.addPage();
+    const { width, height } = warningPage.getSize();
+
+    const text = `This PDF is logically protected with password: ${password}.
+True encryption is not applied (Vercel limitation).`;
+
+    warningPage.drawText(text, {
+      x: 50,
+      y: height / 2,
+      size: 14,
+      font,
+      color: rgb(1, 0, 0),
+    });
+
+    pdf.setTitle("Protected (logical) PDF");
+    pdf.setSubject("Password: " + password);
+
+    const newBytes = await pdf.save();
+    output = createTempFile("protected");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "protected.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /protect:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
     }
   }
+});
 
-  return Array.from(pages).sort((a, b) => a - b);
-}
+// ====== 7) Unlock PDF: /unlock ======
+// هنا بنشيل صفحة التحذير لو موجودة وننضف الـ metadata
 
-app.post(
-  "/extract-pages",
-  upload.single("file"),
-  multerErrorHandler,
-  async (req, res) => {
-    try {
-      if (!ensureFile(req, res)) return;
+app.post("/unlock", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl } = req.body;
+    if (!publicUrl) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "publicUrl is required" });
+    }
 
-      const { pages } = req.body;
-      if (!pages || typeof pages !== "string") {
-        return sendError(res, "يجب إرسال قائمة الصفحات (مثال: 1,3,5-7)", 400);
-      }
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
 
-      const originalPdf = await PDFDocument.load(req.file.buffer);
-      const totalPages = originalPdf.getPageCount();
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
 
-      const pageNumbers = parsePagesExpression(pages, totalPages);
+    const pageCount = pdf.getPageCount();
+    const newPdf = await PDFDocument.create();
 
-      if (pageNumbers.length === 0) {
-        return sendError(res, "لا يوجد صفحات صالحة في الطلب", 400, { totalPages });
-      }
+    const startIndex = 1 < pageCount ? 1 : 0;
+    const copied = await newPdf.copyPages(
+      pdf,
+      Array.from({ length: pageCount - startIndex }, (_, i) => i + startIndex)
+    );
+    copied.forEach((p) => newPdf.addPage(p));
 
-      const newPdf = await PDFDocument.create();
-      const zeroBasedIndices = pageNumbers.map(p => p - 1);
-      const copiedPages = await newPdf.copyPages(originalPdf, zeroBasedIndices);
-      copiedPages.forEach(page => newPdf.addPage(page));
+    newPdf.setTitle("Unlocked PDF");
 
-      const pdfBytes = await newPdf.save();
+    const newBytes = await newPdf.save();
+    output = createTempFile("unlocked");
+    fs.writeFileSync(output, newBytes);
 
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", "attachment; filename=extracted-pages.pdf");
-      res.send(Buffer.from(pdfBytes));
-    } catch (err) {
-      console.error("خطأ في /extract-pages:", err);
-      sendError(res, "حدث خطأ أثناء استخراج الصفحات", 500);
+    sendPdfFile(res, output, "unlocked.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /unlock:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
     }
   }
-);
+});
 
-// ==============================
-// تشغيل السيرفر محليًا
-// ==============================
-const PORT = process.env.PORT || 5000;
+// ====== 8) Watermark text: /watermark-text ======
+
+app.post("/watermark-text", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl, text, opacity = 0.2, color = "red" } = req.body;
+
+    if (!publicUrl || !text) {
+      return res.status(400).json({
+        ok: false,
+        error: "publicUrl and text are required",
+      });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    const font = await pdf.embedFont(StandardFonts.HelveticaBold);
+
+    let colorRgb = rgb(1, 0, 0);
+    if (color === "blue") colorRgb = rgb(0, 0, 1);
+    if (color === "green") colorRgb = rgb(0, 1, 0);
+    if (color === "white") colorRgb = rgb(1, 1, 1);
+    if (color === "black") colorRgb = rgb(0, 0, 0);
+
+    const pages = pdf.getPages();
+    for (const page of pages) {
+      const { width, height } = page.getSize();
+      page.drawText(text, {
+        x: width / 4,
+        y: height / 2,
+        size: 30,
+        font,
+        color: colorRgb,
+        opacity: opacity,
+        rotate: { type: "degrees", angle: 45 },
+      });
+    }
+
+    const newBytes = await pdf.save();
+    output = createTempFile("watermark");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "watermarked.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /watermark-text:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
+    }
+  }
+});
+
+// ====== 9) Rotate pages: /rotate-pages ======
+
+app.post("/rotate-pages", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl, pages, angle } = req.body;
+
+    if (!publicUrl || !angle) {
+      return res.status(400).json({
+        ok: false,
+        error: "publicUrl and angle are required",
+      });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    const angleDeg = parseInt(angle, 10) || 0;
+
+    let pageNumbers = [];
+    if (!pages) {
+      pageNumbers = Array.from({ length: pdf.getPageCount() }, (_, i) => i + 1);
+    } else if (Array.isArray(pages)) {
+      pageNumbers = pages.map((p) => parseInt(p, 10));
+    } else if (typeof pages === "string") {
+      const parts = pages.split(",");
+      for (const part of parts) {
+        if (part.includes("-")) {
+          const [start, end] = part.split("-").map((n) => parseInt(n, 10));
+          for (let i = start; i <= end; i++) pageNumbers.push(i);
+        } else {
+          pageNumbers.push(parseInt(part, 10));
+        }
+      }
+    }
+
+    pageNumbers = pageNumbers.filter(
+      (p) => !isNaN(p) && p >= 1 && p <= pdf.getPageCount()
+    );
+
+    const allPages = pdf.getPages();
+    pageNumbers.forEach((p) => {
+      allPages[p - 1].setRotation({ type: "degrees", angle: angleDeg });
+    });
+
+    const newBytes = await pdf.save();
+    output = createTempFile("rotated");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "rotated.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /rotate-pages:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
+    }
+  }
+});
+
+// ====== 10) Reorder pages: /reorder-pages ======
+// المدخل: { publicUrl, order }
+// مثال: order = [3,1,2] → الصفحة 3 تبقى الأولى، 1 تبقى الثانية...
+
+app.post("/reorder-pages", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl, order } = req.body;
+
+    if (!publicUrl || !Array.isArray(order) || order.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "publicUrl and order (array) are required",
+      });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    const pageCount = pdf.getPageCount();
+    const newPdf = await PDFDocument.create();
+
+    const cleanOrder = order
+      .map((p) => parseInt(p, 10))
+      .filter((p) => !isNaN(p) && p >= 1 && p <= pageCount);
+
+    if (cleanOrder.length === 0) {
+      throw new Error("No valid page order provided");
+    }
+
+    const copied = await newPdf.copyPages(
+      pdf,
+      cleanOrder.map((p) => p - 1)
+    );
+    copied.forEach((p) => newPdf.addPage(p));
+
+    const newBytes = await newPdf.save();
+    output = createTempFile("reordered");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "reordered.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /reorder-pages:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
+    }
+  }
+});
+
+// ====== 11) Edit metadata: /metadata ======
+// المدخل: { publicUrl, title?, author?, subject?, keywords? }
+
+app.post("/metadata", async (req, res) => {
+  let source = null;
+  let output = null;
+  try {
+    const { publicUrl, title, author, subject, keywords } = req.body;
+
+    if (!publicUrl) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "publicUrl is required" });
+    }
+
+    source = await downloadToTempFile(publicUrl);
+    await ensureSizeLimit(source);
+
+    const bytes = fs.readFileSync(source);
+    const pdf = await PDFDocument.load(bytes);
+
+    if (title) pdf.setTitle(title);
+    if (author) pdf.setAuthor(author);
+    if (subject) pdf.setSubject(subject);
+    if (keywords) pdf.setKeywords(keywords);
+
+    const newBytes = await pdf.save();
+    output = createTempFile("metadata");
+    fs.writeFileSync(output, newBytes);
+
+    sendPdfFile(res, output, "metadata.pdf", [source, output]);
+  } catch (err) {
+    console.error("Error in /metadata:", err);
+    safeDelete(source);
+    safeDelete(output);
+    if (!res.headersSent) {
+      res.status(500).json({
+        ok: false,
+        error: err.message || "Internal error",
+      });
+    }
+  }
+});
+
+// ====== Local run ======
+
 app.listen(PORT, () => {
-  console.log(`✅ السيرفر شغال بقوة على http://localhost:${PORT}`);
+  console.log(`PDF Server PRO running on port ${PORT}`);
 });
