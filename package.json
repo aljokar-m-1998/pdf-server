@@ -1,16 +1,26 @@
 {
-  "name": "pdf-server-pro-vercel",
+  "name": "pdf-server-pro",
   "version": "1.0.0",
-  "description": "Full PDF processing server for Vercel (compress, merge, split, extract, protect, watermark, metadata) using pdf-lib",
-  "main": "server.js",
+  "description": "A robust PDF processing API built with Express and pdf-lib for Vercel.",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
+  "keywords": [
+    "pdf",
+    "vercel",
+    "serverless",
+    "express",
+    "pdf-lib"
+  ],
+  "author": "Your Name or Company",
+  "license": "ISC",
   "dependencies": {
-    "axios": "^1.7.0",
-    "express": "^4.19.0",
-    "pdf-lib": "^1.17.1",
-    "pdf-parse": "^1.1.1"
+    "axios": "^1.6.2",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "pdf-lib": "^1.17.1"
   }
 }
