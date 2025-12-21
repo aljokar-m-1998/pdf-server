@@ -1,5 +1,4 @@
 import express from "express";
-import axios from "axios";
 import cors from "cors";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import fs from "fs";
@@ -7,181 +6,119 @@ import path from "path";
 import os from "os";
 import { fileURLToPath } from "url";
 import pdfParse from "pdf-parse";
+import multer from "multer"; // مكتبة للتعامل مع رفع الملفات مباشرة
 
-// ====== Configuration and Initialization ======
-
+// ====== Configuration ======
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 const MAX_SIZE_BYTES = 150 * 1024 * 1024; // 150MB
 
-// Middleware
+// إعداد multer لتخزين الملفات المرفوعة مؤقتاً في مجلد النظام
+const upload = multer({ dest: os.tmpdir() });
+
 app.use(express.json({ limit: "200mb" }));
 app.use(cors());
 
-// Path Helpers for ESM
+// Path Helpers
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ====== File Helpers ======
+// ====== Helpers ======
 
-function createTempFile(prefix = "file") {
-  const random = Math.random().toString(36).substring(2, 10);
-  return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${random}.pdf`);
+function createTempPath(prefix = "output") {
+  return path.join(os.tmpdir(), `${prefix}-${Date.now()}-${Math.random().toString(36).substring(7)}.pdf`);
 }
 
 function safeDelete(filePath) {
-  if (!filePath) return;
-  try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (err) {
-    console.error("Error deleting temp file:", err);
+  if (filePath && fs.existsSync(filePath)) {
+    try { fs.unlinkSync(filePath); } catch (e) {}
   }
 }
 
-async function downloadToTempFile(url) {
-  const tempPath = createTempFile("source");
-  const response = await axios({
-    method: "GET",
-    url,
-    responseType: "stream",
-  });
-
-  return new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(tempPath);
-    response.data.pipe(writer);
-    let error = null;
-
-    writer.on("error", (err) => {
-      error = err;
-      writer.close();
-      reject(err);
-    });
-
-    writer.on("close", () => {
-      if (!error) resolve(tempPath);
-    });
-  });
-}
-
-async function ensureSizeLimit(filePath) {
-  const stats = fs.statSync(filePath);
-  if (stats.size > MAX_SIZE_BYTES) {
-    safeDelete(filePath);
-    throw new Error("File too large (max 150MB)");
-  }
-  return stats.size;
-}
-
-function sendPdfFile(res, filePath, fileName, cleanupPaths = []) {
+function sendPdfAndCleanup(res, filePath, fileName, extraCleanup = []) {
   res.setHeader("Content-Type", "application/pdf");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${fileName || "file.pdf"}"`
-  );
-
+  res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+  
   const stream = fs.createReadStream(filePath);
   stream.pipe(res);
-
   stream.on("close", () => {
-    cleanupPaths.forEach(safeDelete);
+    safeDelete(filePath);
+    extraCleanup.forEach(safeDelete);
   });
-
-  stream.on("error", (err) => {
-    console.error("Error streaming PDF:", err);
-    cleanupPaths.forEach(safeDelete);
-    if (!res.headersSent) {
-      res.status(500).json({ ok: false, error: "Error streaming PDF" });
-    }
-  });
-}
-
-// دالة لوج وهمية بديلة لـ Supabase
-async function saveLog(action, extraInfo = {}) {
-  console.log(`[LOG] Action: ${action}`, extraInfo);
 }
 
 // ====== Routes ======
 
 app.get("/", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    server: "PDF Server PRO (Standalone - No DB)",
-    status: "running"
-  });
+  res.json({ ok: true, message: "PDF Server Pro (No-DB Version) is running." });
 });
 
-app.get("/health", async (req, res) => {
-  await saveLog("health-check");
-  res.status(200).json({ ok: true, message: "Server is healthy" });
-});
-
-// مثال معدل: /compress
-app.post("/compress", async (req, res) => {
-  let source = null;
-  let output = null;
-  try {
-    const { publicUrl } = req.body;
-    if (!publicUrl) return res.status(400).json({ ok: false, error: "publicUrl is required" });
-
-    source = await downloadToTempFile(publicUrl);
-    const originalSize = await ensureSizeLimit(source);
-
-    const bytes = fs.readFileSync(source);
-    const pdfDoc = await PDFDocument.load(bytes);
-    const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
-
-    output = createTempFile("compressed");
-    fs.writeFileSync(output, compressedBytes);
-
-    await saveLog("compress", { originalSize, compressedSize: compressedBytes.length });
-
-    sendPdfFile(res, output, "compressed.pdf", [source, output]);
-  } catch (err) {
-    console.error(err);
-    safeDelete(source);
-    safeDelete(output);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// مثال معدل: /merge
-app.post("/merge", async (req, res) => {
-  const { publicUrls } = req.body;
-  if (!Array.isArray(publicUrls) || publicUrls.length < 2) {
-    return res.status(400).json({ ok: false, error: "At least 2 URLs required" });
+// 1) دمج الملفات - يستقبل الآن مصفوفة من الملفات المرفوعة مباشرة
+app.post("/merge", upload.array("files"), async (req, res) => {
+  const files = req.files;
+  if (!files || files.length < 2) {
+    return res.status(400).json({ ok: false, error: "يرجى رفع ملفين على الأقل للدمج" });
   }
 
-  const tempFiles = [];
-  let mergedPath = null;
+  let mergedPath = createTempPath("merged");
   try {
-    const mergeDoc = await PDFDocument.create();
-    for (const url of publicUrls) {
-      const filePath = await downloadToTempFile(url);
-      tempFiles.push(filePath);
-      await ensureSizeLimit(filePath);
-      const pdf = await PDFDocument.load(fs.readFileSync(filePath));
-      const copied = await mergeDoc.copyPages(pdf, pdf.getPageIndices());
-      copied.forEach((p) => mergeDoc.addPage(p));
+    const mergedDoc = await PDFDocument.create();
+    for (const file of files) {
+      const bytes = fs.readFileSync(file.path);
+      const pdf = await PDFDocument.load(bytes);
+      const copiedPages = await mergedDoc.copyPages(pdf, pdf.getPageIndices());
+      copiedPages.forEach((page) => mergedDoc.addPage(page));
     }
 
-    const mergedBytes = await mergeDoc.save();
-    mergedPath = createTempFile("merged");
+    const mergedBytes = await mergedDoc.save();
     fs.writeFileSync(mergedPath, mergedBytes);
 
-    await saveLog("merge", { filesCount: publicUrls.length });
-    sendPdfFile(res, mergedPath, "merged.pdf", [...tempFiles, mergedPath]);
+    // إرسال الملف المدمج وتنظيف الملفات المؤقتة
+    sendPdfAndCleanup(res, mergedPath, "merged_document.pdf", files.map(f => f.path));
   } catch (err) {
-    tempFiles.forEach(safeDelete);
-    safeDelete(mergedPath);
-    res.status(500).json({ ok: false, error: err.message });
+    console.error(err);
+    files.forEach(f => safeDelete(f.path));
+    res.status(500).json({ ok: false, error: "فشل دمج الملفات" });
   }
 });
 
-// ملاحظة: يمكنك تطبيق نفس المنطق (إزالة الرفع لـ Supabase وإرسال الملف مباشرة) على بقية الـ Endpoints بنفس الطريقة.
+// 2) ضغط الملف - يستقبل ملف واحد
+app.post("/compress", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: "لم يتم رفع ملف" });
 
+  let outputPath = createTempPath("compressed");
+  try {
+    const bytes = fs.readFileSync(req.file.path);
+    const pdfDoc = await PDFDocument.load(bytes);
+    const compressedBytes = await pdfDoc.save({ useObjectStreams: true });
+    
+    fs.writeFileSync(outputPath, compressedBytes);
+    sendPdfAndCleanup(res, outputPath, "compressed.pdf", [req.file.path]);
+  } catch (err) {
+    safeDelete(req.file.path);
+    res.status(500).json({ ok: false, error: "فشل ضغط الملف" });
+  }
+});
+
+// 3) استخراج النص
+app.post("/extract-text", upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: "لم يتم رفع ملف" });
+
+  try {
+    const dataBuffer = fs.readFileSync(req.file.path);
+    const data = await pdfParse(dataBuffer);
+    
+    safeDelete(req.file.path);
+    res.json({ ok: true, text: data.text, pages: data.numpages });
+  } catch (err) {
+    safeDelete(req.file.path);
+    res.status(500).json({ ok: false, error: "فشل استخراج النص" });
+  }
+});
+
+// ====== Start Server ======
 app.listen(PORT, () => {
-  console.log(`PDF Server Standalone running on port ${PORT}`);
+  console.log(`Server running on port ${PORT} (Standalone Mode)`);
 });
 
 export default app;
